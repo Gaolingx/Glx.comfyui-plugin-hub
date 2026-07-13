@@ -10,7 +10,15 @@ from __future__ import annotations
 import math
 import torch
 
-from .solver_types import FlowUniPC2State
+from .flow_math import _rf_lambda, _scalar_float
+from .solver_types import FlowPC3State, FlowUniPC2State
+from .solvers.pc3 import (
+    flow_pc3_damped_step_result,
+    flow_pc3_next_state,
+    flow_pc3_predictor_max_order,
+    flow_pc3_predictor_step_result,
+    flow_pc3_should_endpoint_correct,
+)
 from .solvers.unipc import flow_unipc2_x0_step
 
 
@@ -44,17 +52,91 @@ def _krea_sigmas(model, steps: int, denoise: float, shift_override: float) -> to
     return sigmas[-(steps + 1):]
 
 
-def sample_krea2_flow(model, x, sigmas, extra_args=None, callback=None, disable=None, *, flow_solver="euler", **_):
+def _pc3_diffusers_tail(t, t_next) -> bool:
+    """Identify unstable terminal intervals on a shifted-linear RF grid."""
+    t_value = _scalar_float(torch, t)
+    t_next_value = _scalar_float(torch, t_next)
+    if t_next_value <= 0.0 or t_next_value <= 0.10:
+        return True
+    lambda_gap = _scalar_float(torch, _rf_lambda(torch, t_next) - _rf_lambda(torch, t))
+    return t_value <= 0.25 and lambda_gap >= 0.65
+
+
+def sample_krea2_flow(
+    model,
+    x,
+    sigmas,
+    extra_args=None,
+    callback=None,
+    disable=None,
+    *,
+    flow_solver="euler",
+    pc3_gamma=1.0,
+    pc3_tolerance=0.005,
+    **_,
+):
     """Stable x0/flow solvers on Krea2's native FLUX sigma trajectory."""
     extra_args = extra_args or {}
     previous_d = None
     previous_step = None
     unipc_state = None
+    pc3_state = FlowPC3State()
+    total_steps = len(sigmas) - 1
     for i in range(len(sigmas) - 1):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * x.new_ones([x.shape[0]]), **extra_args)
         if callback is not None:
             callback({"i": i, "sigma": sigma, "sigma_hat": sigma, "denoised": denoised, "x": x})
+
+        if flow_solver == "pc3_diffusers_damped":
+            # The zero endpoint is already the current model's x0 prediction.
+            if float(sigma_next) <= 0.0 or float(sigma) <= 0.0:
+                x = denoised
+                continue
+
+            tail_interval = _pc3_diffusers_tail(sigma, sigma_next)
+            max_order = 1 if tail_interval else flow_pc3_predictor_max_order(i, total_steps)
+            predictor = flow_pc3_predictor_step_result(
+                x,
+                denoised,
+                sigma,
+                sigma_next,
+                state=pc3_state,
+                max_order=max_order,
+            )
+            should_correct = not tail_interval and flow_pc3_should_endpoint_correct(
+                torch,
+                pc3_state,
+                predictor.order,
+                i,
+                total_steps,
+                sigma_next,
+            )
+            if not should_correct:
+                x = predictor.x
+                pc3_state = flow_pc3_next_state(torch, pc3_state, denoised, sigma)
+                continue
+
+            denoised_pred = model(
+                predictor.x,
+                sigma_next * predictor.x.new_ones([predictor.x.shape[0]]),
+                **extra_args,
+            )
+            result = flow_pc3_damped_step_result(
+                x,
+                denoised,
+                denoised_pred,
+                sigma,
+                sigma_next,
+                state=pc3_state,
+                max_gamma=float(pc3_gamma),
+                tolerance=float(pc3_tolerance),
+                x_pred=predictor.x,
+                predictor_order=predictor.order,
+            )
+            pc3_state = result.state
+            x = result.x
+            continue
 
         if flow_solver == "unipc2_diffusers_x0":
             # UniPC2 x0 with the Diffusers-style BH2 update and lower-order
@@ -126,12 +208,29 @@ class Krea2FlowEulerSampler:
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "add_noise": (["enable", "disable"],),
-                "flow_solver": (["euler", "heun", "ab2", "unipc2_diffusers_x0"], {"default": "euler"}),
+                "flow_solver": (["euler", "heun", "ab2", "unipc2_diffusers_x0", "pc3_diffusers_damped"], {"default": "euler"}),
                 "shift_override": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "pc3_gamma": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "pc3_tolerance": ("FLOAT", {"default": 0.005, "min": 0.0, "max": 0.1, "step": 0.001}),
             }
         }
 
-    def sample(self, model, positive, negative, latent_image, seed, steps, cfg, denoise, add_noise, flow_solver, shift_override):
+    def sample(
+        self,
+        model,
+        positive,
+        negative,
+        latent_image,
+        seed,
+        steps,
+        cfg,
+        denoise,
+        add_noise,
+        flow_solver,
+        shift_override,
+        pc3_gamma,
+        pc3_tolerance,
+    ):
         import comfy.sample
         import comfy.samplers
         import comfy.utils
@@ -156,7 +255,11 @@ class Krea2FlowEulerSampler:
         sigmas = _krea_sigmas(model, int(steps), float(denoise), float(shift_override)).to(samples.device)
         sampler = comfy.samplers.KSAMPLER(
             sample_krea2_flow,
-            extra_options={"flow_solver": str(flow_solver)},
+            extra_options={
+                "flow_solver": str(flow_solver),
+                "pc3_gamma": float(pc3_gamma),
+                "pc3_tolerance": float(pc3_tolerance),
+            },
         )
         callback = latent_preview.prepare_callback(model, int(steps))
         output = comfy.sample.sample_custom(

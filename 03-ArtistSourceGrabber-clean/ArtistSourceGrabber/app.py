@@ -1082,7 +1082,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 opened = webbrowser.open(url, new=2)
                 self.send_json({"ok": bool(opened), "message": (
-                    "已在系统浏览器打开；登录后请完全关闭浏览器，再选择自动检测并测试连接"
+                    "已在系统浏览器打开"
                     if opened else "系统未确认浏览器已打开，请手动访问 " + url)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": describe_error(exc)}, 500)
